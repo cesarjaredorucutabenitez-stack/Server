@@ -1,0 +1,8 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "gunicorn --bind 0.0.0.0:$PORT --timeout 600 --workers 2 server:app"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
