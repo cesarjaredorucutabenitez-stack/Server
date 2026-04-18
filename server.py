@@ -1,36 +1,27 @@
 """
-server.py — SC/BC Downloader Cloud Server v1.0
-Deployable en Railway, Render, o cualquier VPS.
-
-Recibe una URL de SoundCloud o Bandcamp,
-descarga el audio con yt-dlp y lo devuelve
-como descarga directa al navegador (streaming).
-
-Requisitos (ver requirements.txt):
-  flask, yt-dlp
-
-Variables de entorno opcionales:
-  PORT        — puerto (default: 8080)
-  API_KEY     — clave secreta para proteger el endpoint (opcional)
-  MAX_SIZE_MB — tamaño máximo de descarga en MB (default: 200)
+server.py — SC/BC Downloader Cloud Server v2.0
+- Nombre de archivo correcto: Artista - Título.mp3
+- Track individual: devuelve MP3 directo
+- Álbum/Playlist: devuelve ZIP con todos los tracks
+- 320kbps CBR + metadatos + carátula
 """
 
+import io
 import os
 import re
 import subprocess
 import tempfile
-import threading
+import zipfile
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 
-from flask import Flask, Response, jsonify, request, stream_with_context
+from flask import Flask, Response, jsonify, request
 
 app = Flask(__name__)
 
-PORT       = int(os.environ.get("PORT", 8080))
-API_KEY    = os.environ.get("API_KEY", "")          # vacío = sin autenticación
-MAX_SIZE   = int(os.environ.get("MAX_SIZE_MB", 200)) * 1024 * 1024
-VERSION    = "1.0.0"
+PORT    = int(os.environ.get("PORT", 8080))
+API_KEY = os.environ.get("API_KEY", "")
+VERSION = "2.0.0"
 
 # ─── CORS ────────────────────────────────────────────────────
 
@@ -39,6 +30,7 @@ def add_cors(response):
     response.headers["Access-Control-Allow-Origin"]  = "*"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key"
+    response.headers["Access-Control-Expose-Headers"] = "Content-Disposition, X-Filename"
     return response
 
 @app.route("/", defaults={"path": ""}, methods=["OPTIONS"])
@@ -55,21 +47,24 @@ def check_auth():
 
 # ─── Validación ───────────────────────────────────────────────
 
-ALLOWED_HOSTS = {
-    "soundcloud.com", "www.soundcloud.com",
-    "bandcamp.com",   "www.bandcamp.com",
-}
+ALLOWED_HOSTS = {"soundcloud.com", "www.soundcloud.com", "bandcamp.com", "www.bandcamp.com"}
 
-def is_valid_url(url: str) -> bool:
+def is_valid_url(url):
     try:
         host = urlparse(url).netloc.lower().lstrip("www.")
         return host in ALLOWED_HOSTS or host.endswith(".bandcamp.com")
-    except Exception:
+    except:
         return False
 
-def safe_filename(name: str) -> str:
+def safe_filename(name):
     name = re.sub(r'[\\/*?:"<>|]', "", name).strip()
     return name or "track"
+
+def content_disposition(filename):
+    """Genera header Content-Disposition compatible con todos los navegadores."""
+    ascii_name = filename.encode('ascii', 'ignore').decode('ascii') or "download"
+    utf8_name  = quote(filename, safe='')
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{utf8_name}"
 
 # ─── Rutas ────────────────────────────────────────────────────
 
@@ -93,15 +88,13 @@ def download():
     if mode not in ("track", "album", "playlist"):
         mode = "track"
 
-    # Para álbumes devolvemos un ZIP con todos los tracks
     if mode in ("album", "playlist"):
-        return download_collection(url, mode)
+        return download_collection(url)
     else:
         return download_single(url)
 
 
-def download_single(url: str):
-    """Descarga un track y lo devuelve como stream al navegador."""
+def download_single(url):
     with tempfile.TemporaryDirectory() as tmpdir:
         out_template = os.path.join(tmpdir, "%(uploader)s - %(title)s.%(ext)s")
 
@@ -123,34 +116,27 @@ def download_single(url: str):
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
 
-        # Buscar el archivo generado
         mp3_files = list(Path(tmpdir).glob("*.mp3"))
         if not mp3_files:
             error = (result.stderr.strip().split("\n") or ["Error desconocido"])[-1]
             return jsonify({"status": "error", "message": error[:300]}), 500
 
         mp3_path = mp3_files[0]
-        filename = safe_filename(mp3_path.name)
-
-        # Leer y devolver como descarga directa
+        filename = safe_filename(mp3_path.stem) + ".mp3"
         file_data = mp3_path.read_bytes()
 
         return Response(
             file_data,
             mimetype="audio/mpeg",
             headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Disposition": content_disposition(filename),
                 "Content-Length":      str(len(file_data)),
                 "X-Filename":          filename,
             }
         )
 
 
-def download_collection(url: str, mode: str):
-    """Descarga un álbum/playlist completo y lo devuelve como ZIP."""
-    import zipfile
-    import io
-
+def download_collection(url):
     with tempfile.TemporaryDirectory() as tmpdir:
         out_template = os.path.join(
             tmpdir,
@@ -173,33 +159,37 @@ def download_collection(url: str, mode: str):
             url,
         ]
 
+        # Obtener nombre del álbum/playlist primero
+        info_cmd = ["yt-dlp", "--flat-playlist", "--print", "%(playlist_title|%(title)s)s", "--playlist-items", "1", url]
+        info = subprocess.run(info_cmd, capture_output=True, text=True, timeout=60)
+        playlist_name = safe_filename((info.stdout.strip().split("\n")[0]) or "album")
+
         subprocess.run(cmd, capture_output=True, text=True, timeout=600)
 
         mp3_files = sorted(Path(tmpdir).glob("*.mp3"))
         if not mp3_files:
             return jsonify({"status": "error", "message": "No se encontraron tracks"}), 500
 
-        # Empaquetar en ZIP en memoria
+        # Empaquetar en ZIP
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
             for f in mp3_files:
                 zf.write(f, f.name)
         zip_buffer.seek(0)
+        zip_data = zip_buffer.read()
 
-        # Nombre del ZIP basado en el primer archivo
-        zip_name = safe_filename(mp3_files[0].stem.split(" - ", 2)[-1] if mp3_files else "album") + ".zip"
+        zip_filename = playlist_name + ".zip"
 
         return Response(
-            zip_buffer.read(),
+            zip_data,
             mimetype="application/zip",
             headers={
-                "Content-Disposition": f'attachment; filename="{zip_name}"',
-                "X-Filename": zip_name,
+                "Content-Disposition": content_disposition(zip_filename),
+                "Content-Length":      str(len(zip_data)),
+                "X-Filename":          zip_filename,
             }
         )
 
-
-# ─── Main ─────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT, debug=False)
